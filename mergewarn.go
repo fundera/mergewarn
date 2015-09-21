@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 
 	"gopkg.in/fsnotify.v1"
 	"gopkg.in/libgit2/git2go.v22"
@@ -61,12 +59,7 @@ func parseDiff(diff *git.Diff) map[string]map[int]bool {
 	return fileEdits
 }
 
-func buildDiff() (*git.Diff, error) {
-	repo, err := git.OpenRepository(repoDirectory)
-	if err != nil {
-		log.Fatal(err)
-	}
-
+func getLocalTree(repo *git.Repository) (*git.Tree, error) {
 	rev, err := repo.RevparseSingle("origin/master^{tree}")
 	if err != nil {
 		log.Fatal(err)
@@ -77,6 +70,41 @@ func buildDiff() (*git.Diff, error) {
 		log.Fatal(err)
 	}
 
+	return tree, err
+}
+
+func getLocalFileListing() []string {
+	repo, err := git.OpenRepository(repoDirectory)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	tree, err := getLocalTree(repo)
+	var allFiles []string
+
+	tree.Walk(func(str string, entry *git.TreeEntry) int {
+		if entry.Type == git.ObjectBlob {
+			fullPath := repoDirectory + "/" + str + entry.Name
+			allFiles = append(allFiles, fullPath)
+		}
+
+		return 0
+	})
+
+	return allFiles
+}
+
+func buildDiff() (*git.Diff, error) {
+	repo, err := git.OpenRepository(repoDirectory)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	tree, err := getLocalTree(repo)
+	if err != nil {
+		panic(err)
+	}
+
 	diff, err := repo.DiffTreeToWorkdir(tree, nil)
 	if err != nil {
 		log.Fatal(err)
@@ -85,7 +113,7 @@ func buildDiff() (*git.Diff, error) {
 	return diff, err
 }
 
-func buildAndParseDiff() ([]byte, error) {
+func buildLocalFileEdits() []FileEdit {
 	diff, err := buildDiff()
 	if err != nil {
 		log.Fatal(err)
@@ -105,8 +133,7 @@ func buildAndParseDiff() ([]byte, error) {
 		sanitizedFileEdits = append(sanitizedFileEdits, f)
 	}
 
-	jsonBody, err := json.Marshal(sanitizedFileEdits)
-	return jsonBody, err
+	return sanitizedFileEdits
 }
 
 func notice(str string) {
@@ -121,25 +148,45 @@ func sendAndNotifyChange(redisClient *redis.Client, jsonBody []byte) {
 
 func processAllDiffs(redisClient *redis.Client) {
 	allDiffs := redisClient.HGetAllMap("mergewarnDiffs")
+	diffUserMap, err := allDiffs.Result()
 
-	diffMap, err := allDiffs.Result()
+	localFileEdits := buildLocalFileEdits()
+
 	if err != nil {
 		fmt.Println(err)
 	}
 
-	usersInMap := ""
-	masterDiff := make(map[string]map[int]bool)
-
-	// MERGE DIFFS
-
 	// {"filename":"frontend/stylesheets/bootstrap_application.css.sass","lineNumbers":[33]},{"filename":"package.json","lineNumbers":[1]}
-	for user, diff := range diffMap {
-		fmt.Println(diff)
-		usersInMap += user
-		usersInMap += ","
-	}
+	for user, diffSet := range diffUserMap {
+		fileEdits := []FileEdit{}
+		json.Unmarshal([]byte(diffSet), &fileEdits)
 
-	notice("Message Received: " + usersInMap)
+		// iterate through each file diff and create a notice if that user is editing that line. Oh no!
+
+		for idx := range fileEdits {
+			fileEdit := fileEdits[idx]
+
+			for localIdx := range localFileEdits {
+				localFileEdit := localFileEdits[localIdx]
+
+				// also check for line number collision here
+				if localFileEdit.Filename == fileEdit.Filename {
+
+					for a := range localFileEdit.LineNumbers {
+						for b := range fileEdit.LineNumbers {
+							if localFileEdit.LineNumbers[a] == fileEdit.LineNumbers[b] {
+								s := fmt.Sprintf("MERGE WARN!!! User: %s, Filename: %s, Line Number: %d", user, fileEdit.Filename, fileEdit.LineNumbers[b])
+								notice(s)
+							}
+						}
+					}
+
+				}
+			}
+		}
+
+		notice(user)
+	}
 }
 
 func waitForServerChanges(redisClient *redis.Client) {
@@ -189,7 +236,9 @@ func waitForLocalChanges(redisClient *redis.Client) {
 			select {
 			case ev := <-watcher.Events:
 				if ev.Op != fsnotify.Chmod {
-					jsonBody, err := buildAndParseDiff()
+					fileEdits := buildLocalFileEdits()
+					jsonBody, err := json.Marshal(fileEdits)
+
 					if err != nil {
 						log.Fatal(err)
 					}
@@ -203,20 +252,17 @@ func waitForLocalChanges(redisClient *redis.Client) {
 	}()
 
 	dirsAdded := 0
+	allFiles := getLocalFileListing()
 
-	// Gather ALL DIRS RECURSIVELY using filepath.Walk and the FileInfo isDir
-	filepath.Walk(repoDirectory, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
-			watchErr := watcher.Add(repoDirectory)
-			if watchErr != nil {
-				log.Fatal(watchErr)
-			}
-			dirsAdded = dirsAdded + 1
+	for i := range allFiles {
+		watchErr := watcher.Add(allFiles[i])
+		if watchErr != nil {
+			log.Fatal(watchErr)
 		}
-		return err
-	})
+		dirsAdded = dirsAdded + 1
+	}
 
-	str := fmt.Sprintf("Added %d directories!", dirsAdded)
+	str := fmt.Sprintf("Watching %d directories.", dirsAdded)
 	notice(str)
 
 	<-done
