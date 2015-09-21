@@ -4,15 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 
 	"gopkg.in/fsnotify.v1"
 	"gopkg.in/libgit2/git2go.v22"
 	"gopkg.in/redis.v3"
 )
-
-const repoDirectory = "/Users/rdeshpande/dev/fundera"
-const redisURI = "localhost:6379"
-const currentUser = "rohan"
 
 // FileEdit convert maps from above into structs for encoding
 type FileEdit struct {
@@ -20,9 +17,29 @@ type FileEdit struct {
 	LineNumbers []int  `json:"lineNumbers"`
 }
 
+// Configuration is the global configuration for mergewarn.
+type Configuration struct {
+	RedisUri      string `json:"RedisUri"`
+	RepoDirectory string `json:"RepoDirectory"`
+	CurrentUser   string `json:"CurrentUser"`
+}
+
+var config *Configuration
+
+func initConfig() *Configuration {
+	file, _ := os.Open("mergewarn.conf")
+	decoder := json.NewDecoder(file)
+	configuration := Configuration{}
+	err := decoder.Decode(&configuration)
+	if err != nil {
+		fmt.Println("error:", err)
+	}
+	return &configuration
+}
+
 func initRedisClient() *redis.Client {
 	return redis.NewClient(&redis.Options{
-		Addr:     redisURI,
+		Addr:     config.RedisUri,
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})
@@ -74,7 +91,7 @@ func getLocalTree(repo *git.Repository) (*git.Tree, error) {
 }
 
 func getLocalFileListing() []string {
-	repo, err := git.OpenRepository(repoDirectory)
+	repo, err := git.OpenRepository(config.RepoDirectory)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -84,7 +101,7 @@ func getLocalFileListing() []string {
 
 	tree.Walk(func(str string, entry *git.TreeEntry) int {
 		if entry.Type == git.ObjectBlob {
-			fullPath := repoDirectory + "/" + str + entry.Name
+			fullPath := config.RepoDirectory + "/" + str + entry.Name
 			allFiles = append(allFiles, fullPath)
 		}
 
@@ -95,7 +112,7 @@ func getLocalFileListing() []string {
 }
 
 func buildDiff() (*git.Diff, error) {
-	repo, err := git.OpenRepository(repoDirectory)
+	repo, err := git.OpenRepository(config.RepoDirectory)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -141,7 +158,7 @@ func notice(str string) {
 }
 
 func sendAndNotifyChange(redisClient *redis.Client, jsonBody []byte) {
-	redisClient.HSet("mergewarnDiffs", "fundera_"+currentUser, string(jsonBody))
+	redisClient.HSet("mergewarnDiffs", "fundera_"+config.CurrentUser, string(jsonBody))
 	notice("Publishing changes..")
 	redisClient.Publish("newChange", "1")
 }
@@ -194,7 +211,7 @@ func waitForServerChanges(redisClient *redis.Client) {
 	go func() {
 		pubsub, err := redisClient.Subscribe("newChange")
 		if err != nil {
-			panic("ERROR: Cannot connect to redis server. Make sure it is running at " + redisURI)
+			panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisUri)
 		}
 		defer pubsub.Close()
 		notice("Waiting for changes..")
@@ -272,6 +289,7 @@ func waitForLocalChanges(redisClient *redis.Client) {
 
 // StartClient starts the mergewarn client and sends data to the server periodically.
 func main() {
+	config = initConfig()
 	redisClient := initRedisClient()
 
 	waitForServerChanges(redisClient)
