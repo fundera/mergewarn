@@ -22,6 +22,7 @@ type Configuration struct {
 	RedisURI      string `json:"RedisURI"`
 	RepoDirectory string `json:"RepoDirectory"`
 	CurrentUser   string `json:"CurrentUser"`
+	RedisPassword string `json:"RedisPassword"`
 }
 
 var config *Configuration
@@ -40,8 +41,8 @@ func initConfig() *Configuration {
 func initRedisClient() *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr:     config.RedisURI,
-		Password: "", // no password set
-		DB:       0,  // use default DB
+		Password: config.RedisPassword,
+		DB:       0, // use default DB
 	})
 }
 
@@ -207,36 +208,33 @@ func processAllDiffs(redisClient *redis.Client) {
 }
 
 func waitForServerChanges(redisClient *redis.Client) {
-	// Process diff changes
-	go func() {
-		pubsub, err := redisClient.Subscribe("newChange")
+	pubsub, err := redisClient.Subscribe("newChange")
+	if err != nil {
+		panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisURI)
+	}
+	defer pubsub.Close()
+	notice("Waiting for changes..")
+
+	for {
+		msgi, err := pubsub.Receive()
+
 		if err != nil {
-			panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisURI)
-		}
-		defer pubsub.Close()
-		notice("Waiting for changes..")
-
-		for {
-			msgi, err := pubsub.Receive()
-
+			err := pubsub.Ping("")
 			if err != nil {
-				err := pubsub.Ping("")
-				if err != nil {
-					panic(err)
-				}
-			}
-
-			switch msg := msgi.(type) {
-			case *redis.Subscription:
-			case *redis.Message:
-				processAllDiffs(redisClient)
-			case *redis.Pong:
-				fmt.Println(msg)
-			default:
-				panic(fmt.Sprintf("unknown message: %#v", msgi))
+				panic(err)
 			}
 		}
-	}()
+
+		switch msg := msgi.(type) {
+		case *redis.Subscription:
+		case *redis.Message:
+			processAllDiffs(redisClient)
+		case *redis.Pong:
+			fmt.Println(msg)
+		default:
+			panic(fmt.Sprintf("unknown message: %#v", msgi))
+		}
+	}
 }
 
 func waitForLocalChanges(redisClient *redis.Client) {
@@ -292,6 +290,6 @@ func main() {
 	config = initConfig()
 	redisClient := initRedisClient()
 
-	waitForServerChanges(redisClient)
+	go waitForServerChanges(redisClient)
 	waitForLocalChanges(redisClient)
 }

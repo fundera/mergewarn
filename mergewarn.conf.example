@@ -1,0 +1,6 @@
+{
+  "RepoDirectory": "/path/to/your/repo",
+  "CurrentUser": "your username (can be anythign unique)",
+  "RedisURI": "host:6379",
+  "RedisPassword": "some password"
+}
