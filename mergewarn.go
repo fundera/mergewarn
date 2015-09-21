@@ -19,7 +19,7 @@ type FileEdit struct {
 
 // Configuration is the global configuration for mergewarn.
 type Configuration struct {
-	RedisUri      string `json:"RedisUri"`
+	RedisURI      string `json:"RedisURI"`
 	RepoDirectory string `json:"RepoDirectory"`
 	CurrentUser   string `json:"CurrentUser"`
 }
@@ -39,7 +39,7 @@ func initConfig() *Configuration {
 
 func initRedisClient() *redis.Client {
 	return redis.NewClient(&redis.Options{
-		Addr:     config.RedisUri,
+		Addr:     config.RedisURI,
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})
@@ -211,7 +211,7 @@ func waitForServerChanges(redisClient *redis.Client) {
 	go func() {
 		pubsub, err := redisClient.Subscribe("newChange")
 		if err != nil {
-			panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisUri)
+			panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisURI)
 		}
 		defer pubsub.Close()
 		notice("Waiting for changes..")
