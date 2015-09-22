@@ -176,33 +176,30 @@ func processAllDiffs(redisClient *redis.Client) {
 
 	// {"filename":"frontend/stylesheets/bootstrap_application.css.sass","lineNumbers":[33]},{"filename":"package.json","lineNumbers":[1]}
 	for user, diffSet := range diffUserMap {
-		if user == config.CurrentUser {
-			next
-		}
+		if user != config.CurrentUser {
+			fileEdits := []FileEdit{}
+			json.Unmarshal([]byte(diffSet), &fileEdits)
 
-		fileEdits := []FileEdit{}
-		json.Unmarshal([]byte(diffSet), &fileEdits)
+			// iterate through each file diff and create a notice if that user is editing that line. Oh no!
 
-		// iterate through each file diff and create a notice if that user is editing that line. Oh no!
+			for idx := range fileEdits {
+				fileEdit := fileEdits[idx]
 
-		for idx := range fileEdits {
-			fileEdit := fileEdits[idx]
+				for localIdx := range localFileEdits {
+					localFileEdit := localFileEdits[localIdx]
 
-			for localIdx := range localFileEdits {
-				localFileEdit := localFileEdits[localIdx]
+					// also check for line number collision here
+					if localFileEdit.Filename == fileEdit.Filename {
 
-				// also check for line number collision here
-				if localFileEdit.Filename == fileEdit.Filename {
-
-					for a := range localFileEdit.LineNumbers {
-						for b := range fileEdit.LineNumbers {
-							if localFileEdit.LineNumbers[a] == fileEdit.LineNumbers[b] {
-								s := fmt.Sprintf("MERGE WARN!!! User: %s, Filename: %s, Line Number: %d", user, fileEdit.Filename, fileEdit.LineNumbers[b])
-								notice(s)
+						for a := range localFileEdit.LineNumbers {
+							for b := range fileEdit.LineNumbers {
+								if localFileEdit.LineNumbers[a] == fileEdit.LineNumbers[b] {
+									s := fmt.Sprintf("MERGE WARN!!! User: %s, Filename: %s, Line Number: %d", user, fileEdit.Filename, fileEdit.LineNumbers[b])
+									notice(s)
+								}
 							}
 						}
 					}
-
 				}
 			}
 		}
