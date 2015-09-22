@@ -176,6 +176,10 @@ func processAllDiffs(redisClient *redis.Client) {
 
 	// {"filename":"frontend/stylesheets/bootstrap_application.css.sass","lineNumbers":[33]},{"filename":"package.json","lineNumbers":[1]}
 	for user, diffSet := range diffUserMap {
+		if user == config.CurrentUser {
+			next
+		}
+
 		fileEdits := []FileEdit{}
 		json.Unmarshal([]byte(diffSet), &fileEdits)
 
@@ -202,8 +206,6 @@ func processAllDiffs(redisClient *redis.Client) {
 				}
 			}
 		}
-
-		notice(user)
 	}
 }
 
