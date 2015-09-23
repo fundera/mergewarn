@@ -135,7 +135,12 @@ func buildLocalFileEdits() []FileEdit {
 }
 
 func notice(str string) {
-	fmt.Println("*** " + str)
+	fmt.Print("[")
+	fmt.Print(time.Now())
+	fmt.Print("]")
+	fmt.Print(" ")
+	fmt.Print(str)
+	fmt.Print("\n")
 }
 
 func sendAndNotifyChange(redisClient *redis.Client, jsonBody []byte) {
