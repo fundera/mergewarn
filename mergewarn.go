@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
+	"time"
 
-	"gopkg.in/fsnotify.v1"
 	"gopkg.in/libgit2/git2go.v22"
 	"gopkg.in/redis.v3"
 )
@@ -91,27 +92,6 @@ func getLocalTree(repo *git.Repository) (*git.Tree, error) {
 	return tree, err
 }
 
-func getLocalFileListing() []string {
-	repo, err := git.OpenRepository(config.RepoDirectory)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	tree, err := getLocalTree(repo)
-	var allFiles []string
-
-	tree.Walk(func(str string, entry *git.TreeEntry) int {
-		if entry.Type == git.ObjectBlob {
-			fullPath := config.RepoDirectory + "/" + str + entry.Name
-			allFiles = append(allFiles, fullPath)
-		}
-
-		return 0
-	})
-
-	return allFiles
-}
-
 func buildDiff() (*git.Diff, error) {
 	repo, err := git.OpenRepository(config.RepoDirectory)
 	if err != nil {
@@ -159,8 +139,7 @@ func notice(str string) {
 }
 
 func sendAndNotifyChange(redisClient *redis.Client, jsonBody []byte) {
-	redisClient.HSet("mergewarnDiffs", "fundera_"+config.CurrentUser, string(jsonBody))
-	notice("Publishing changes..")
+	redisClient.HSet("mergewarnDiffs", config.CurrentUser, string(jsonBody))
 	redisClient.Publish("newChange", "1")
 }
 
@@ -212,7 +191,7 @@ func waitForServerChanges(redisClient *redis.Client) {
 		panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisURI)
 	}
 	defer pubsub.Close()
-	notice("Waiting for changes..")
+	notice("Waiting for changes from the server..")
 
 	for {
 		msgi, err := pubsub.Receive()
@@ -237,54 +216,25 @@ func waitForServerChanges(redisClient *redis.Client) {
 }
 
 func waitForLocalChanges(redisClient *redis.Client) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal(err)
-	}
+	lastFileEdits := []FileEdit{}
 
-	done := make(chan bool)
+	for {
+		fileEdits := buildLocalFileEdits()
 
-	// Process watch events
-	go func() {
-		for {
-			select {
-			case ev := <-watcher.Events:
-				if ev.Op != fsnotify.Chmod {
-					fileEdits := buildLocalFileEdits()
-					jsonBody, err := json.Marshal(fileEdits)
+		if !reflect.DeepEqual(lastFileEdits, fileEdits) {
+			notice("Publishing change...")
+			jsonBody, err := json.Marshal(fileEdits)
 
-					if err != nil {
-						log.Fatal(err)
-					}
-					sendAndNotifyChange(redisClient, jsonBody)
-				}
-
-			case err := <-watcher.Errors:
-				log.Println("error:", err)
+			if err != nil {
+				log.Fatal(err)
 			}
+			sendAndNotifyChange(redisClient, jsonBody)
+			lastFileEdits = fileEdits
 		}
-	}()
-
-	dirsAdded := 0
-	allFiles := getLocalFileListing()
-
-	for i := range allFiles {
-		watchErr := watcher.Add(allFiles[i])
-		if watchErr != nil {
-			log.Fatal(watchErr)
-		}
-		dirsAdded = dirsAdded + 1
+		time.Sleep(5 * time.Second)
 	}
-
-	str := fmt.Sprintf("Watching %d directories.", dirsAdded)
-	notice(str)
-
-	<-done
-
-	watcher.Close()
 }
 
-// StartClient starts the mergewarn client and sends data to the server periodically.
 func main() {
 	config = initConfig()
 	redisClient := initRedisClient()
