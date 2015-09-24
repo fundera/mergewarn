@@ -29,7 +29,7 @@ type Configuration struct {
 var config *Configuration
 
 func initConfig() *Configuration {
-	file, _ := os.Open("mergewarn.conf")
+	file, _ := os.Open("mergewarn.conf.js")
 	decoder := json.NewDecoder(file)
 	configuration := Configuration{}
 	err := decoder.Decode(&configuration)
