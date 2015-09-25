@@ -16,6 +16,7 @@ import (
 type FileEdit struct {
 	Filename    string `json:"filename"`
 	LineNumbers []int  `json:"lineNumbers"`
+	User        string `json:"user"`
 }
 
 // Configuration is the global configuration for mergewarn.
@@ -24,6 +25,7 @@ type Configuration struct {
 	RepoDirectory string `json:"RepoDirectory"`
 	CurrentUser   string `json:"CurrentUser"`
 	RedisPassword string `json:"RedisPassword"`
+	TestMode      bool   `json:"TestMode"`
 }
 
 var config *Configuration
@@ -78,7 +80,12 @@ func parseDiff(diff *git.Diff) map[string]map[int]bool {
 	return fileEdits
 }
 
-func getLocalTree(repo *git.Repository) (*git.Tree, error) {
+func buildDiff() (*git.Diff, error) {
+	repo, err := git.OpenRepository(config.RepoDirectory)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	rev, err := repo.RevparseSingle("origin/master^{tree}")
 	if err != nil {
 		log.Fatal(err)
@@ -87,20 +94,6 @@ func getLocalTree(repo *git.Repository) (*git.Tree, error) {
 	tree, err := repo.LookupTree(rev.Id())
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	return tree, err
-}
-
-func buildDiff() (*git.Diff, error) {
-	repo, err := git.OpenRepository(config.RepoDirectory)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	tree, err := getLocalTree(repo)
-	if err != nil {
-		panic(err)
 	}
 
 	diff, err := repo.DiffTreeToWorkdir(tree, nil)
@@ -135,10 +128,8 @@ func buildLocalFileEdits() []FileEdit {
 }
 
 func notice(str string) {
-	fmt.Print("[")
 	fmt.Print(time.Now())
-	fmt.Print("]")
-	fmt.Print(" ")
+	fmt.Print("|")
 	fmt.Print(str)
 	fmt.Print("\n")
 }
@@ -148,7 +139,7 @@ func sendAndNotifyChange(redisClient *redis.Client, jsonBody []byte) {
 	redisClient.Publish("newChange", "1")
 }
 
-func processAllDiffs(redisClient *redis.Client) {
+func calculateConflicts(redisClient *redis.Client) (conflictFileEdits []FileEdit) {
 	allDiffs := redisClient.HGetAllMap("mergewarnDiffs")
 	diffUserMap, err := allDiffs.Result()
 
@@ -160,14 +151,18 @@ func processAllDiffs(redisClient *redis.Client) {
 
 	// {"filename":"frontend/stylesheets/bootstrap_application.css.sass","lineNumbers":[33]},{"filename":"package.json","lineNumbers":[1]}
 	for user, diffSet := range diffUserMap {
-		if user != config.CurrentUser {
-			fileEdits := []FileEdit{}
-			json.Unmarshal([]byte(diffSet), &fileEdits)
+
+		// Only process diffs if it isn't the current user or we aren't in test mode.
+		// Test Mode would allow a single user to test the app.
+		//
+		if user != config.CurrentUser || config.TestMode {
+			incomingFileEdits := []FileEdit{}
+			json.Unmarshal([]byte(diffSet), &incomingFileEdits)
 
 			// iterate through each file diff and create a notice if that user is editing that line. Oh no!
 
-			for idx := range fileEdits {
-				fileEdit := fileEdits[idx]
+			for idx := range incomingFileEdits {
+				fileEdit := incomingFileEdits[idx]
 
 				for localIdx := range localFileEdits {
 					localFileEdit := localFileEdits[localIdx]
@@ -178,8 +173,8 @@ func processAllDiffs(redisClient *redis.Client) {
 						for a := range localFileEdit.LineNumbers {
 							for b := range fileEdit.LineNumbers {
 								if localFileEdit.LineNumbers[a] == fileEdit.LineNumbers[b] {
-									s := fmt.Sprintf("MERGE WARN!!! User: %s, Filename: %s, Line Number: %d", user, fileEdit.Filename, fileEdit.LineNumbers[b])
-									notice(s)
+									localFileEdit.User = user
+									conflictFileEdits = append(conflictFileEdits, localFileEdit)
 								}
 							}
 						}
@@ -188,6 +183,18 @@ func processAllDiffs(redisClient *redis.Client) {
 			}
 		}
 	}
+
+	return conflictFileEdits
+}
+
+func outputConflicts(conflicts []FileEdit) {
+	jsonBody, err := json.Marshal(conflicts)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	notice(string(jsonBody))
 }
 
 func waitForServerChanges(redisClient *redis.Client) {
@@ -196,7 +203,6 @@ func waitForServerChanges(redisClient *redis.Client) {
 		panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisURI)
 	}
 	defer pubsub.Close()
-	notice("Waiting for changes from the server..")
 
 	for {
 		msgi, err := pubsub.Receive()
@@ -211,7 +217,8 @@ func waitForServerChanges(redisClient *redis.Client) {
 		switch msg := msgi.(type) {
 		case *redis.Subscription:
 		case *redis.Message:
-			processAllDiffs(redisClient)
+			fetchedConflicts := calculateConflicts(redisClient)
+			outputConflicts(fetchedConflicts)
 		case *redis.Pong:
 			fmt.Println(msg)
 		default:
@@ -227,7 +234,6 @@ func waitForLocalChanges(redisClient *redis.Client) {
 		fileEdits := buildLocalFileEdits()
 
 		if !reflect.DeepEqual(lastFileEdits, fileEdits) {
-			notice("Publishing change...")
 			jsonBody, err := json.Marshal(fileEdits)
 
 			if err != nil {
@@ -241,6 +247,9 @@ func waitForLocalChanges(redisClient *redis.Client) {
 }
 
 func main() {
+	fmt.Println("------------------------------")
+	fmt.Println("MergeWarn listener starting...")
+	fmt.Println("------------------------------")
 	config = initConfig()
 	redisClient := initRedisClient()
 
