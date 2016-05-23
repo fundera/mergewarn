@@ -2,10 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
-	"os"
 	"reflect"
+	"sort"
 	"time"
 
 	"gopkg.in/libgit2/git2go.v22"
@@ -17,37 +18,13 @@ type FileEdit struct {
 	Filename    string `json:"filename"`
 	LineNumbers []int  `json:"lineNumbers"`
 	User        string `json:"user"`
+	Branch      string `json:"branch"`
 }
 
-// Configuration is the global configuration for mergewarn.
-type Configuration struct {
-	RedisURI      string `json:"RedisURI"`
-	RepoDirectory string `json:"RepoDirectory"`
-	CurrentUser   string `json:"CurrentUser"`
-	RedisPassword string `json:"RedisPassword"`
-	TestMode      bool   `json:"TestMode"`
-}
-
-var config *Configuration
-
-func initConfig() *Configuration {
-	file, _ := os.Open("mergewarn.conf.js")
-	decoder := json.NewDecoder(file)
-	configuration := Configuration{}
-	err := decoder.Decode(&configuration)
-	if err != nil {
-		fmt.Println("error:", err)
-	}
-	return &configuration
-}
-
-func initRedisClient() *redis.Client {
-	return redis.NewClient(&redis.Options{
-		Addr:     config.RedisURI,
-		Password: config.RedisPassword,
-		DB:       0, // use default DB
-	})
-}
+var redisURI = flag.String("uri", "localhost:6379", "Specify the Redis URI")
+var repoDirectory = flag.String("dir", ".", "Directory of the repository to track")
+var currentUser = flag.String("user", "", "Git user to trace back to")
+var redisPassword = flag.String("redispw", "", "Redis Password")
 
 func parseDiff(diff *git.Diff) map[string]map[int]bool {
 	fileEdits := make(map[string]map[int]bool)
@@ -80,13 +57,8 @@ func parseDiff(diff *git.Diff) map[string]map[int]bool {
 	return fileEdits
 }
 
-func buildDiff() (*git.Diff, error) {
-	repo, err := git.OpenRepository(config.RepoDirectory)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	rev, err := repo.RevparseSingle("origin/master^{tree}")
+func getTreeRev(repo *git.Repository, branchName string) *git.Tree {
+	rev, err := repo.RevparseSingle(branchName + "^{tree}")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -96,19 +68,41 @@ func buildDiff() (*git.Diff, error) {
 		log.Fatal(err)
 	}
 
-	diff, err := repo.DiffTreeToWorkdir(tree, nil)
+	return tree
+}
+
+func buildDiff(repo *git.Repository, branchName string) (*git.Diff, error) {
+	masterTree := getTreeRev(repo, "master")
+
+	if branchName == "master" {
+		// If we are working on master, then just diff against
+		// the current tree.
+		// TODO: is WithIndex the right thing here?
+		diff, err := repo.DiffTreeToWorkdirWithIndex(masterTree, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		return diff, err
+	}
+
+	otherTree := getTreeRev(repo, branchName)
+	opts, err := git.DefaultDiffOptions()
+	diff, err := repo.DiffTreeToTree(masterTree, otherTree, &opts)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	return diff, err
 }
 
 func buildLocalFileEdits() []FileEdit {
-	diff, err := buildDiff()
+	repo, err := git.OpenRepository(*repoDirectory)
 	if err != nil {
 		log.Fatal(err)
 	}
+	head, _ := repo.Head()
+	branchName, _ := head.Branch().Name()
+
+	diff, _ := buildDiff(repo, branchName)
 	fileEdits := parseDiff(diff)
 
 	sanitizedFileEdits := []FileEdit{}
@@ -116,26 +110,22 @@ func buildLocalFileEdits() []FileEdit {
 	for tempFilename, lineNumberMap := range fileEdits {
 		f := FileEdit{}
 		f.Filename = tempFilename
+		f.User = *currentUser
+		f.Branch = branchName
 
 		for l := range lineNumberMap {
 			f.LineNumbers = append(f.LineNumbers, l)
 		}
 
+		sort.Ints(f.LineNumbers)
 		sanitizedFileEdits = append(sanitizedFileEdits, f)
 	}
 
 	return sanitizedFileEdits
 }
 
-func notice(str string) {
-	fmt.Print(time.Now())
-	fmt.Print("|")
-	fmt.Print(str)
-	fmt.Print("\n")
-}
-
 func sendAndNotifyChange(redisClient *redis.Client, jsonBody []byte) {
-	redisClient.HSet("mergewarnDiffs", config.CurrentUser, string(jsonBody))
+	redisClient.HSet("mergewarnDiffs", *currentUser, string(jsonBody))
 	redisClient.Publish("newChange", "1")
 }
 
@@ -151,32 +141,30 @@ func calculateConflicts(redisClient *redis.Client) (conflictFileEdits []FileEdit
 
 	// {"filename":"frontend/stylesheets/bootstrap_application.css.sass","lineNumbers":[33]},{"filename":"package.json","lineNumbers":[1]}
 	for user, diffSet := range diffUserMap {
-
-		// Only process diffs if it isn't the current user or we aren't in test mode.
-		// Test Mode would allow a single user to test the app.
-		//
-		if user != config.CurrentUser || config.TestMode {
+		if user != *currentUser {
 			incomingFileEdits := []FileEdit{}
 			json.Unmarshal([]byte(diffSet), &incomingFileEdits)
 
 			// iterate through each file diff and create a notice if that user is editing that line. Oh no!
 
-			for idx := range incomingFileEdits {
-				fileEdit := incomingFileEdits[idx]
-
-				for localIdx := range localFileEdits {
-					localFileEdit := localFileEdits[localIdx]
+			for _, fileEdit := range incomingFileEdits {
+				for _, localFileEdit := range localFileEdits {
+					localFileEdit.User = user
 
 					// also check for line number collision here
 					if localFileEdit.Filename == fileEdit.Filename {
+						shouldAdd := false
 
-						for a := range localFileEdit.LineNumbers {
-							for b := range fileEdit.LineNumbers {
-								if localFileEdit.LineNumbers[a] == fileEdit.LineNumbers[b] {
-									localFileEdit.User = user
-									conflictFileEdits = append(conflictFileEdits, localFileEdit)
+						for _, localLineNumber := range localFileEdit.LineNumbers {
+							for _, remoteLineNumber := range fileEdit.LineNumbers {
+								if localLineNumber == remoteLineNumber {
+									shouldAdd = true
 								}
 							}
+						}
+
+						if shouldAdd {
+							conflictFileEdits = append(conflictFileEdits, localFileEdit)
 						}
 					}
 				}
@@ -194,13 +182,18 @@ func outputConflicts(conflicts []FileEdit) {
 		log.Fatal(err)
 	}
 
-	notice(string(jsonBody))
+	fmt.Print("INCOMING|")
+	fmt.Print(time.Now())
+	fmt.Print("|")
+	fmt.Print(string(jsonBody))
+	fmt.Print("\n")
 }
 
 func waitForServerChanges(redisClient *redis.Client) {
+	var oldConflicts []FileEdit
 	pubsub, err := redisClient.Subscribe("newChange")
 	if err != nil {
-		panic("ERROR: Cannot connect to redis server. Make sure it is running at " + config.RedisURI)
+		panic("ERROR: Cannot connect to redis server. Make sure it is running at " + *redisURI)
 	}
 	defer pubsub.Close()
 
@@ -218,7 +211,12 @@ func waitForServerChanges(redisClient *redis.Client) {
 		case *redis.Subscription:
 		case *redis.Message:
 			fetchedConflicts := calculateConflicts(redisClient)
-			outputConflicts(fetchedConflicts)
+
+			if len(fetchedConflicts) > 0 || (len(fetchedConflicts) == 0 && len(oldConflicts) > 0) {
+				outputConflicts(fetchedConflicts)
+			}
+
+			oldConflicts = fetchedConflicts
 		case *redis.Pong:
 			fmt.Println(msg)
 		default:
@@ -250,8 +248,14 @@ func main() {
 	fmt.Println("------------------------------")
 	fmt.Println("MergeWarn listener starting...")
 	fmt.Println("------------------------------")
-	config = initConfig()
-	redisClient := initRedisClient()
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     *redisURI,
+		Password: *redisPassword,
+		DB:       0, // use default DB
+	})
+
+	flag.Parse()
 
 	go waitForServerChanges(redisClient)
 	waitForLocalChanges(redisClient)
